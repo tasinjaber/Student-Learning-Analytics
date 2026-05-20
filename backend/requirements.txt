@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pymongo
+motor
+pandas
+python-dotenv
+kagglehub
+openai
+google-genai
+groq
+scikit-learn
+openpyxl
+httpx
+python-multipart

@@ -1,0 +1,499 @@
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import jsPDF from "jspdf";
+import {
+  Bar, BarChart, CartesianGrid, Legend, Line, LineChart,
+  Pie, PieChart, ReferenceLine, ResponsiveContainer,
+  Scatter, ScatterChart, Tooltip, XAxis, YAxis,
+} from "recharts";
+
+import HeatmapCalendar from "../components/HeatmapCalendar";
+import DatasetManager from "../components/DatasetManager";
+import InfoTip from "../components/InfoTip";
+import MetricCard from "../components/MetricCard";
+import {
+  exportDataUrl,
+  fetchActiveDaysHistogram,
+  fetchActivityBreakdown,
+  fetchAiInsights,
+  fetchAnomalies,
+  fetchAtRisk,
+  fetchCourses,
+  fetchEngagementVsGrade,
+  fetchForecast,
+  fetchHeatmap,
+  fetchOverview,
+  fetchScoreDistribution,
+  fetchTrend,
+} from "../services/analyticsApi";
+
+export default function DashboardPage({ user, activeDataset, onDatasetChange }) {
+  const navigate = useNavigate();
+  const dsId = activeDataset?.dataset_id ?? null;
+
+  const [overview, setOverview] = useState(null);
+  const [trendData, setTrendData] = useState([]);
+  const [activityData, setActivityData] = useState([]);
+  const [scoreDistribution, setScoreDistribution] = useState([]);
+  const [riskRows, setRiskRows] = useState([]);
+  const [courses, setCourses] = useState([]);
+  const [activeDaysHist, setActiveDaysHist] = useState([]);
+  const [scatter, setScatter] = useState({ points: [], correlation: null });
+  const [forecast, setForecast] = useState({ historical: [], forecast: [], trend_direction: "" });
+  const [anomalies, setAnomalies] = useState([]);
+  const [heatmap, setHeatmap] = useState([]);
+  const [filters, setFilters] = useState({ startDate: "", endDate: "", course: "" });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [aiInsights, setAiInsights] = useState({ groq: "", gemini: "", openai: "" });
+  const [aiErrors, setAiErrors] = useState({ groq: "", gemini: "", openai: "" });
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiProvider, setAiProvider] = useState("groq");
+  const [showDatasetMgr, setShowDatasetMgr] = useState(false);
+  const [secondaryLoading, setSecondaryLoading] = useState(false);
+
+  const isEdx = overview?.dataset_mode === "edx_person_course";
+  const activeFilters = useMemo(() => ({ ...filters, datasetId: dsId }), [filters, dsId]);
+
+  async function loadData(f) {
+    const fWithDs = { ...f, datasetId: dsId };
+    try {
+      setLoading(true);
+      setError("");
+      const [o, t, a, s, c] = await Promise.all([
+        fetchOverview(fWithDs),
+        fetchTrend(fWithDs),
+        fetchActivityBreakdown(fWithDs),
+        fetchScoreDistribution(fWithDs),
+        fetchCourses(dsId),
+      ]);
+      setOverview(o);
+      setTrendData(t);
+      setActivityData(a);
+      setScoreDistribution(s);
+      setCourses(c);
+      setLoading(false);
+
+      setSecondaryLoading(true);
+      const secondaryPromises = [
+        fetchActiveDaysHistogram(fWithDs),
+        fetchEngagementVsGrade(fWithDs),
+        fetchForecast(fWithDs),
+        fetchAnomalies(fWithDs),
+        fetchHeatmap(dsId),
+      ];
+      if (user?.role === "admin") secondaryPromises.push(fetchAtRisk(8, fWithDs));
+
+      const results = await Promise.all(secondaryPromises);
+      setActiveDaysHist(Array.isArray(results[0]) ? results[0] : []);
+      setScatter({ points: Array.isArray(results[1]?.points) ? results[1].points : [], correlation: results[1]?.correlation ?? null });
+      setForecast(results[2]);
+      setAnomalies(results[3]?.anomalies ?? []);
+      setHeatmap(Array.isArray(results[4]) ? results[4] : []);
+      if (user?.role === "admin") setRiskRows(results[5] ?? []);
+      else setRiskRows([]);
+    } catch {
+      setError("Failed to load analytics. Make sure the backend is running and you are logged in.");
+      setLoading(false);
+    } finally {
+      setSecondaryLoading(false);
+    }
+  }
+
+  useEffect(() => { loadData(filters); }, [user?.role, dsId]);
+
+  function updateFilter(key, value) { setFilters((prev) => ({ ...prev, [key]: value })); }
+  function applyFilters() { loadData(filters); }
+  function clearFilters() { const r = { startDate: "", endDate: "", course: "" }; setFilters(r); loadData(r); }
+
+  async function generateAiInsight() {
+    setAiLoading(true);
+    setAiErrors((prev) => ({ ...prev, [aiProvider]: "" }));
+    try {
+      const result = await fetchAiInsights(activeFilters, aiProvider);
+      if (result.error) setAiErrors((prev) => ({ ...prev, [aiProvider]: result.error }));
+      else setAiInsights((prev) => ({ ...prev, [aiProvider]: result.insight }));
+    } catch { setAiErrors((prev) => ({ ...prev, [aiProvider]: "Failed to generate insights." })); }
+    finally { setAiLoading(false); }
+  }
+
+  function exportPdf() {
+    const doc = new jsPDF();
+    doc.setFontSize(16);
+    doc.text("Student Learning Analytics Report", 14, 18);
+    doc.setFontSize(11);
+    doc.text(`Generated by: ${user?.username} (${user?.role})`, 14, 27);
+    doc.text(`Dataset: ${activeDataset?.name ?? "Default"}`, 14, 35);
+    let y = 44;
+    doc.text(`Unique students: ${overview.total_students}`, 14, y); y += 7;
+    doc.text(`Total interactions: ${overview.total_interactions}`, 14, y); y += 7;
+    doc.text(`Average score: ${overview.average_score}`, 14, y); y += 7;
+    doc.text("At-risk students (admin view)", 14, y + 4); y += 12;
+    riskRows.forEach((row, idx) => {
+      doc.text(`${idx + 1}. ${row.student_id} | score ${row.avg_score} | risk ${row.risk_score}`, 14, y);
+      y += 7;
+      if (y > 275) { doc.addPage(); y = 18; }
+    });
+    doc.save("learning-analytics-report.pdf");
+  }
+
+  if (loading) return <p className="state-text">Loading dashboard…</p>;
+  if (error) return <p className="state-text error">{error}</p>;
+
+  const forecastCombined = [
+    ...forecast.historical.slice(-14).map((d) => ({ ...d, is_forecast: false })),
+    ...forecast.forecast,
+  ];
+  const anomalyDates = new Set(anomalies.map((a) => a.date));
+
+  return (
+    <section className="dashboard">
+
+      {/* Dataset selector */}
+      <div className="dataset-selector-bar">
+        <span className="dataset-selector-label">Dataset:</span>
+        <span className="dataset-selector-name">{activeDataset?.name ?? "Default"}</span>
+        <button className="btn btn-secondary-dark" onClick={() => setShowDatasetMgr(true)}>
+          Manage datasets
+        </button>
+      </div>
+
+      {showDatasetMgr && (
+        <DatasetManager
+          activeDataset={activeDataset}
+          onSelect={(ds) => { onDatasetChange(ds); }}
+          onClose={() => setShowDatasetMgr(false)}
+        />
+      )}
+
+      {/* Dataset type info row */}
+      <div className="dataset-info-row">
+        <span className="dataset-type-tag">
+          {isEdx ? "Open edX Dataset" : "Event Log Dataset"}
+        </span>
+        <span className="dataset-info-sep">·</span>
+        <span>{overview.total_students} students</span>
+        <span className="dataset-info-sep">·</span>
+        <span>{Number(overview.total_interactions).toLocaleString()} interactions</span>
+        {isEdx && overview.certification_rate_percent != null && (
+          <>
+            <span className="dataset-info-sep">·</span>
+            <span>Certification rate: {overview.certification_rate_percent}%</span>
+          </>
+        )}
+        {isEdx && overview.events_grade_correlation != null && (
+          <>
+            <span className="dataset-info-sep">·</span>
+            <span>Events↔Grade correlation: {overview.events_grade_correlation}</span>
+          </>
+        )}
+        {!isEdx && (
+          <span className="dataset-info-hint">
+            Upload an Open edX CSV to unlock per-course certification and event-grade analysis
+          </span>
+        )}
+      </div>
+
+      {/* Filters */}
+      <article className="filter-card">
+        <h3 style={{ margin: "0 0 12px", fontSize: "0.92rem", color: "#475569", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+          Filters
+        </h3>
+        <div className="filter-grid">
+          <label>Start date<input type="date" value={filters.startDate} onChange={(e) => updateFilter("startDate", e.target.value)} /></label>
+          <label>End date<input type="date" value={filters.endDate} onChange={(e) => updateFilter("endDate", e.target.value)} /></label>
+          <label>
+            {isEdx ? "Course" : "Course"}
+            <select value={filters.course} onChange={(e) => updateFilter("course", e.target.value)}>
+              <option value="">All courses</option>
+              {courses.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </label>
+          <div className="filter-actions">
+            <button className="btn btn-primary" onClick={applyFilters}>Apply</button>
+            <button className="btn btn-secondary-dark" onClick={clearFilters}>Reset</button>
+            {user?.role === "admin" && (
+              <>
+                <button className="btn btn-secondary-dark" onClick={exportPdf}>PDF</button>
+                <a className="btn btn-secondary-dark" href={exportDataUrl("csv", activeFilters)} download>CSV</a>
+                <a className="btn btn-secondary-dark" href={exportDataUrl("excel", activeFilters)} download>Excel</a>
+              </>
+            )}
+          </div>
+        </div>
+      </article>
+
+      {/* Summary metric cards */}
+      <div className="metrics-grid">
+        <MetricCard
+          title="Unique learners"
+          value={overview.total_students}
+          helper="Total distinct students in the dataset"
+        />
+        <MetricCard
+          title={isEdx ? "Enrollments" : "Recorded rows"}
+          value={overview.total_enrollments ?? overview.total_interactions}
+          helper={isEdx ? "Student–course registration count" : "Total activity rows after filters"}
+        />
+        <MetricCard
+          title={isEdx ? "Total events" : "Total interactions"}
+          value={overview.total_interactions}
+          helper={isEdx ? "Sum of all platform events (nevents)" : "All recorded activity events"}
+        />
+        <MetricCard
+          title="Average score"
+          value={overview.average_score}
+          helper={isEdx ? "Mean grade across all enrollments (%)" : "Mean score across all recorded activities"}
+        />
+      </div>
+
+      {isEdx ? (
+        <div className="metrics-grid">
+          <MetricCard title="Avg active days" value={overview.average_study_duration} helper="Average days each student was active on the platform (ndays_act)" />
+          <MetricCard title="Avg video plays" value={overview.average_video_plays} helper="Average number of video plays per student (nplay_video)" />
+          <MetricCard title="Avg chapters" value={overview.average_chapters} helper="Average course chapters visited per student (nchapters)" />
+          <MetricCard title="Avg forum posts" value={overview.average_forum_posts} helper="Average discussion forum contributions per student" />
+        </div>
+      ) : (
+        <div className="metrics-grid">
+          <MetricCard title="Avg session duration" value={overview.average_study_duration} helper="Average time spent per activity session (minutes)" />
+          <MetricCard title="Active last 7 days" value={overview.active_last_7_days ?? 0} helper="Students who recorded at least one activity in the past 7 days" />
+        </div>
+      )}
+
+      {/* Charts row */}
+      <div className="chart-grid">
+        <article className="chart-card">
+          <div className="chart-card-head">
+            <h3>
+              Engagement over time
+              <InfoTip text={isEdx
+                ? "Monthly sum of platform events per student. A rising trend means students are becoming more active."
+                : "Number of student interactions recorded each day. Spikes or drops may indicate special events or breaks."
+              } />
+            </h3>
+            <p className="chart-hint">{isEdx ? "Monthly events (sum)" : "Daily interaction count"}</p>
+          </div>
+          {trendData.length === 0 ? <p className="chart-empty">No dated activity found in this dataset.</p> : (
+            <ResponsiveContainer width="100%" height={280}>
+              <LineChart data={trendData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" tick={{ fontSize: 10 }} />
+                <YAxis />
+                <Tooltip />
+                {anomalies.map((a) => (
+                  <ReferenceLine key={a.date} x={a.date} stroke={a.type === "spike" ? "#f59e0b" : "#ef4444"} strokeDasharray="4 2" label={{ value: a.type, fontSize: 9 }} />
+                ))}
+                <Line type="monotone" dataKey="interactions" stroke="#4f46e5" strokeWidth={2} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+          {anomalies.length > 0 && (
+            <p className="chart-hint" style={{ marginTop: 6 }}>
+              Unusual activity detected: {anomalies.map((a) => `${a.date} (${a.type})`).join(", ")}
+            </p>
+          )}
+        </article>
+
+        <article className="chart-card">
+          <div className="chart-card-head">
+            <h3>
+              Activity breakdown
+              <InfoTip text={isEdx
+                ? "Average count of each activity type per enrolled student (video plays, forum posts, chapters, etc.)."
+                : "How student activity is split across different event types (e.g. video, quiz, forum)."
+              } />
+            </h3>
+            <p className="chart-hint">{isEdx ? "Avg per enrollment" : "Event type counts"}</p>
+          </div>
+          <ResponsiveContainer width="100%" height={280}>
+            <BarChart data={activityData}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="activity" angle={-18} height={70} interval={0} tick={{ fontSize: 11 }} />
+              <YAxis />
+              <Tooltip />
+              <Legend />
+              <Bar dataKey="count" fill="#0ea5e9" />
+            </BarChart>
+          </ResponsiveContainer>
+        </article>
+
+        <article className="chart-card">
+          <div className="chart-card-head">
+            <h3>
+              Score distribution
+              <InfoTip text="Shows how many students fall into each grade range (e.g. 0–20%, 21–40%…). Useful for spotting whether most students are passing or struggling." />
+            </h3>
+          </div>
+          <ResponsiveContainer width="100%" height={280}>
+            <PieChart>
+              <Pie data={scoreDistribution} dataKey="students" nameKey="range" outerRadius={95} fill="#4f46e5" label />
+              <Tooltip />
+            </PieChart>
+          </ResponsiveContainer>
+        </article>
+      </div>
+
+      {/* Engagement forecast */}
+      {forecastCombined.length > 0 && (
+        <article className="chart-card" style={{ marginTop: 16 }}>
+          <div className="chart-card-head">
+            <h3>
+              Engagement forecast
+              <InfoTip text="Uses the last 30 days of activity to project the next 7 days using a linear trend. The dashed portion is the prediction — useful for planning ahead." />
+            </h3>
+            <p className="chart-hint">
+              7-day projection · trend: <strong>{forecast.trend_direction}</strong>
+            </p>
+          </div>
+          <ResponsiveContainer width="100%" height={260}>
+            <LineChart data={forecastCombined}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="date" tick={{ fontSize: 10 }} />
+              <YAxis />
+              <Tooltip />
+              <Line
+                type="monotone"
+                dataKey="interactions"
+                stroke="#4f46e5"
+                strokeWidth={2}
+                dot={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </article>
+      )}
+
+      {/* Activity heatmap */}
+      {heatmap.length > 0 && (
+        <article className="chart-card" style={{ marginTop: 16 }}>
+          <div className="chart-card-head">
+            <h3>
+              Activity calendar
+              <InfoTip text="Each cell is one day. Darker color = more activity recorded on that day. Similar to GitHub's contribution graph. Shows seasonal patterns and gaps." />
+            </h3>
+            <p className="chart-hint">Last 12 months · daily counts</p>
+          </div>
+          <HeatmapCalendar data={heatmap} />
+        </article>
+      )}
+
+      {/* Active days histogram */}
+      {activeDaysHist.length > 0 && (
+        <article className="chart-card" style={{ marginTop: 16 }}>
+          <div className="chart-card-head">
+            <h3>
+              Active days distribution
+              <InfoTip text="How many days each student was active on the platform. A large number of students with only 1–5 active days may indicate low engagement or early dropout." />
+            </h3>
+            <p className="chart-hint">Students grouped by days active</p>
+          </div>
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={activeDaysHist}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="bucket" />
+              <YAxis allowDecimals={false} />
+              <Tooltip />
+              <Bar dataKey="enrollments" fill="#a855f7" />
+            </BarChart>
+          </ResponsiveContainer>
+        </article>
+      )}
+
+      {/* Engagement vs grade scatter */}
+      {scatter.points?.length > 0 && (
+        <article className="chart-card" style={{ marginTop: 16 }}>
+          <div className="chart-card-head">
+            <h3>
+              Activity vs grade
+              <InfoTip text="Each dot is one student. X-axis = number of platform events; Y-axis = final grade. If the dots trend upward left-to-right, more active students tend to get higher grades." />
+            </h3>
+            <p className="chart-hint">
+              Correlation: <strong>{scatter.correlation != null ? scatter.correlation : "n/a"}</strong>
+            </p>
+          </div>
+          <ResponsiveContainer width="100%" height={300}>
+            <ScatterChart margin={{ top: 12, right: 12, left: 4, bottom: 12 }}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis type="number" dataKey="nevents" name="Total events" tick={{ fontSize: 11 }} label={{ value: "Total events", position: "insideBottom", offset: -4, fontSize: 11 }} />
+              <YAxis type="number" dataKey="grade_percent" name="Grade %" tick={{ fontSize: 11 }} label={{ value: "Grade %", angle: -90, position: "insideLeft", fontSize: 11 }} />
+              <Tooltip cursor={{ strokeDasharray: "3 3" }} />
+              <Scatter name="Students" data={scatter.points} fill="#0ea5e9" opacity={0.7} />
+            </ScatterChart>
+          </ResponsiveContainer>
+        </article>
+      )}
+
+      {/* AI Insights */}
+      <article className="chart-card ai-insights-card" style={{ marginTop: 16 }}>
+        <div className="chart-card-head">
+          <h3>
+            AI Insights
+            <InfoTip text="An AI model reads the current metrics (student counts, scores, at-risk count, activity breakdown) and writes a plain-language summary with recommendations." />
+          </h3>
+          <div className="ai-provider-toggle">
+            {[{ key: "groq", label: "Groq" }, { key: "gemini", label: "Gemini" }, { key: "openai", label: "ChatGPT" }].map(({ key, label }) => (
+              <button key={key} className={`ai-toggle-btn ${aiProvider === key ? "active" : ""}`} onClick={() => setAiProvider(key)}>{label}</button>
+            ))}
+          </div>
+        </div>
+        {aiInsights[aiProvider]
+          ? <p className="ai-insight-text">{aiInsights[aiProvider]}</p>
+          : <p className="ai-insight-placeholder">Click "Generate" to get an AI-written summary using {{ groq: "Groq (LLaMA 3.3)", gemini: "Google Gemini", openai: "ChatGPT" }[aiProvider]}.</p>
+        }
+        {aiErrors[aiProvider] && <p className="ai-insight-error">{aiErrors[aiProvider]}</p>}
+        <button className="btn btn-primary ai-generate-btn" onClick={generateAiInsight} disabled={aiLoading}>
+          {aiLoading ? "Generating…" : aiInsights[aiProvider] ? "Regenerate" : "Generate Insights"}
+        </button>
+      </article>
+
+      {/* At-risk table (admin only) */}
+      {user?.role === "admin" ? (
+        <article className="table-card" style={{ marginTop: 16 }}>
+          <h3>
+            At-risk students
+            <InfoTip text="Students flagged as at-risk based on low scores, long inactivity, and low total activity. Sorted by risk score — the higher the score, the more concern. Click a student name to view their full profile." />
+          </h3>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th title="Click the student ID to open their individual profile page">Student</th>
+                  <th title="Average score across all recorded assessments (%)">Avg score</th>
+                  {isEdx
+                    ? <th title="Total platform events recorded for this student">Total events</th>
+                    : <th title="Total time spent on platform activities (minutes)">Session time</th>
+                  }
+                  <th title="Number of days since this student's last recorded activity">Days inactive</th>
+                  <th title="Combined risk score (0–1). Calculated from low score + inactivity + low activity volume. Higher = more at risk.">Risk score</th>
+                </tr>
+              </thead>
+              <tbody>
+                {riskRows.length === 0 && (
+                  <tr><td colSpan={5} style={{ textAlign: "center", color: "#94a3b8", padding: "20px" }}>No at-risk students found with current filters.</td></tr>
+                )}
+                {riskRows.map((row) => (
+                  <tr key={`${row.student_id}-${row.risk_score}`}>
+                    <td>
+                      <button className="link-btn" onClick={() => navigate(`/student/${encodeURIComponent(row.student_id)}`)}>
+                        {row.student_id}
+                      </button>
+                    </td>
+                    <td>{row.avg_score}</td>
+                    {isEdx ? <td>{row.avg_events ?? "—"}</td> : <td>{row.total_duration_minutes}</td>}
+                    <td>{row.inactivity_days}</td>
+                    <td>{row.risk_score}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </article>
+      ) : (
+        <p className="state-text" style={{ color: "#94a3b8", fontSize: "0.88rem" }}>
+          Sign in as admin to view the at-risk student list and export reports.
+        </p>
+      )}
+    </section>
+  );
+}
